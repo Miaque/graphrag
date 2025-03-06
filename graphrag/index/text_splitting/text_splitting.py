@@ -4,6 +4,7 @@
 """A module containing the 'Tokenizer', 'TextSplitter', 'NoopTextSplitter' and 'TokenTextSplitter' models."""
 
 import logging
+import re
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Collection, Iterable
 from dataclasses import dataclass
@@ -22,6 +23,24 @@ EncodeFn = Callable[[str], EncodedText]
 LengthFn = Callable[[str], int]
 
 log = logging.getLogger(__name__)
+
+
+def _split_text_with_regex(
+    text: str, separator: str, keep_separator: bool
+) -> list[str]:
+    # Now that we have the separator, split the text
+    if separator:
+        if keep_separator:
+            # The parentheses in the pattern keep the delimiters in the result.
+            _splits = re.split(f"({re.escape(separator)})", text)
+            splits = [_splits[i - 1] + _splits[i] for i in range(1, len(_splits), 2)]
+            if len(_splits) % 2 != 0:
+                splits += _splits[-1:]
+        else:
+            splits = re.split(separator, text)
+    else:
+        splits = list(text)
+    return [s for s in splits if (s not in {"", "\n"})]
 
 
 @dataclass(frozen=True)
@@ -70,6 +89,58 @@ class TextSplitter(ABC):
     @abstractmethod
     def split_text(self, text: str | list[str]) -> Iterable[str]:
         """Split text method definition."""
+
+    def _join_docs(self, docs: list[str], separator: str) -> str | None:
+        text = separator.join(docs)
+        text = text.strip()
+        if text == "":
+            return None
+        return text
+
+    def _merge_splits(
+        self, splits: Iterable[str], separator: str, lengths: list[int]
+    ) -> list[str]:
+        # We now want to combine these smaller pieces into medium size
+        # chunks to send to the LLM.
+        separator_len = self._length_function(separator)
+
+        docs = []
+        current_doc: list[str] = []
+        total = 0
+        index = 0
+        for d in splits:
+            _len = lengths[index]
+            if (
+                total + _len + (separator_len if len(current_doc) > 0 else 0)
+                > self._chunk_size
+            ):
+                if total > self._chunk_size:
+                    log.warning(
+                        f"Created a chunk of size {total}, which is longer than the specified {self._chunk_size}"
+                    )
+                if len(current_doc) > 0:
+                    doc = self._join_docs(current_doc, separator)
+                    if doc is not None:
+                        docs.append(doc)
+                    # Keep on popping if:
+                    # - we have a larger chunk than in the chunk overlap
+                    # - or if we still have any chunks and the length is long
+                    while total > self._chunk_overlap or (
+                        total + _len + (separator_len if len(current_doc) > 0 else 0)
+                        > self._chunk_size
+                        and total > 0
+                    ):
+                        total -= self._length_function(current_doc[0]) + (
+                            separator_len if len(current_doc) > 1 else 0
+                        )
+                        current_doc = current_doc[1:]
+            current_doc.append(d)
+            total += _len + (separator_len if len(current_doc) > 1 else 0)
+            index += 1
+        doc = self._join_docs(current_doc, separator)
+        if doc is not None:
+            docs.append(doc)
+        return docs
 
 
 class NoopTextSplitter(TextSplitter):
@@ -191,3 +262,104 @@ def split_multiple_texts_on_tokens(
         chunk_ids = input_ids[start_idx:cur_idx]
 
     return result
+
+
+class CharacterTextSplitter(TextSplitter):
+    """Splitting text that looks at characters."""
+
+    def __init__(self, separator: str = "\n\n", **kwargs: Any) -> None:
+        """Create a new TextSplitter."""
+        super().__init__(**kwargs)
+        self._separator = separator
+
+    def split_text(self, text: str) -> list[str]:
+        """Split incoming text and return chunks."""
+        # First we naively split the large input into a bunch of smaller ones.
+        splits = _split_text_with_regex(text, self._separator, self._keep_separator)
+        _separator = "" if self._keep_separator else self._separator
+        _good_splits_lengths = []  # cache the lengths of the splits
+        for split in splits:
+            _good_splits_lengths.append(self._length_function(split))
+        return self._merge_splits(splits, _separator, _good_splits_lengths)
+
+
+def split_text_on_tokens(*, text: str, tokenizer: Tokenizer) -> list[str]:
+    """Split incoming text and return chunks using tokenizer."""
+    splits: list[str] = []
+    input_ids = tokenizer.encode(text)
+    start_idx = 0
+    cur_idx = min(start_idx + tokenizer.tokens_per_chunk, len(input_ids))
+    chunk_ids = input_ids[start_idx:cur_idx]
+    while start_idx < len(input_ids):
+        splits.append(tokenizer.decode(chunk_ids))
+        start_idx += tokenizer.tokens_per_chunk - tokenizer.chunk_overlap
+        cur_idx = min(start_idx + tokenizer.tokens_per_chunk, len(input_ids))
+        chunk_ids = input_ids[start_idx:cur_idx]
+    return splits
+
+
+class RecursiveCharacterTextSplitter(TextSplitter):
+    """Splitting text by recursively look at characters.
+
+    Recursively tries to split by different characters to find one
+    that works.
+    """
+
+    def __init__(
+        self,
+        separators: list[str] | None = None,
+        keep_separator: bool = True,
+        **kwargs: Any,
+    ) -> None:
+        """Create a new TextSplitter."""
+        super().__init__(keep_separator=keep_separator, **kwargs)
+        self._separators = separators or ["\n\n", "\n", " ", ""]
+
+    def _split_text(self, text: str, separators: list[str]) -> list[str]:
+        final_chunks = []
+        separator = separators[-1]
+        new_separators = []
+
+        for i, _s in enumerate(separators):
+            if _s == "":
+                separator = _s
+                break
+            if re.search(_s, text):
+                separator = _s
+                new_separators = separators[i + 1 :]
+                break
+
+        splits = _split_text_with_regex(text, separator, self._keep_separator)
+        _good_splits = []
+        _good_splits_lengths = []  # cache the lengths of the splits
+        _separator = "" if self._keep_separator else separator
+
+        for s in splits:
+            s_len = self._length_function(s)
+            if s_len < self._chunk_size:
+                _good_splits.append(s)
+                _good_splits_lengths.append(s_len)
+            else:
+                if _good_splits:
+                    merged_text = self._merge_splits(
+                        _good_splits, _separator, _good_splits_lengths
+                    )
+                    final_chunks.extend(merged_text)
+                    _good_splits = []
+                    _good_splits_lengths = []
+                if not new_separators:
+                    final_chunks.append(s)
+                else:
+                    other_info = self._split_text(s, new_separators)
+                    final_chunks.extend(other_info)
+
+        if _good_splits:
+            merged_text = self._merge_splits(
+                _good_splits, _separator, _good_splits_lengths
+            )
+            final_chunks.extend(merged_text)
+
+        return final_chunks
+
+    def split_text(self, text: str) -> list[str]:
+        return self._split_text(text, self._separators)

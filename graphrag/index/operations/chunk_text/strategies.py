@@ -10,6 +10,9 @@ import tiktoken
 
 from graphrag.config.models.chunking_config import ChunkingConfig
 from graphrag.index.operations.chunk_text.typing import TextChunk
+from graphrag.index.text_splitting.chinese_recursive_text_splitter import (
+    ChineseRecursiveTextSplitter,
+)
 from graphrag.index.text_splitting.text_splitting import (
     Tokenizer,
     split_multiple_texts_on_tokens,
@@ -61,6 +64,26 @@ def run_sentences(
     """Chunks text into multiple parts by sentence."""
     for doc_idx, text in enumerate(input):
         sentences = nltk.sent_tokenize(text)
+        for sentence in sentences:
+            yield TextChunk(
+                text_chunk=sentence,
+                source_doc_indices=[doc_idx],
+            )
+        tick(1)
+
+
+def run_sentences_chinese(
+    input: list[str], _config: ChunkingConfig, tick: ProgressTicker
+) -> Iterable[TextChunk]:
+    """Chunks text into multiple parts by sentence."""
+    splitter = ChineseRecursiveTextSplitter(
+        keep_separator=True,
+        is_separator_regex=True,
+        chunk_size=_config.size,
+        chunk_overlap=_config.overlap,
+    )
+    for doc_idx, text in enumerate(input):
+        sentences = splitter.split_text(text)
         for sentence in sentences:
             yield TextChunk(
                 text_chunk=sentence,

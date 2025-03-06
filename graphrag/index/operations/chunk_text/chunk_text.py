@@ -125,6 +125,12 @@ def load_strategy(strategy: ChunkStrategyType) -> ChunkStrategy:
 
             bootstrap()
             return run_sentences
+        case ChunkStrategyType.chinese_splitter:
+            from graphrag.index.operations.chunk_text.strategies import (
+                run_sentences_chinese,
+            )
+
+            return run_sentences_chinese
         case _:
             msg = f"Unknown strategy: {strategy}"
             raise ValueError(msg)

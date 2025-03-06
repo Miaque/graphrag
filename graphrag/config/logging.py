@@ -26,10 +26,11 @@ def enable_logging(log_filepath: str | Path, verbose: bool = False) -> None:
 
     logging.basicConfig(
         filename=log_filepath,
-        filemode="a",
-        format="%(asctime)s,%(msecs)d %(name)s %(levelname)s %(message)s",
-        datefmt="%H:%M:%S",
+        filemode="w",
+        format="%(asctime)s.%(msecs)03d %(levelname)s [%(threadName)s] [%(filename)s:%(lineno)d] - %(message)s",
+        datefmt=None,
         level=logging.DEBUG if verbose else logging.INFO,
+        encoding="utf-8",
     )
 
 
